@@ -1,14 +1,24 @@
 import numpy as np
 import pandas as pd
 from tqdm.auto import tqdm
-from transformers import AdamW, get_linear_schedule_with_warmup, AutoTokenizer, AutoModel, TrainingArguments
-from datasets import load_from_disk, concatenate_datasets
+from transformers import AdamW, get_linear_schedule_with_warmup, AutoTokenizer, TrainingArguments
+from datasets import load_from_disk, concatenate_datasets, Dataset
 from torch.utils.data import DataLoader, TensorDataset
 import pickle
 import os
 import torch
 import torch.nn.functional as F
-from typing import List, Optional, Tuple, NoReturn
+from typing import List, Optional, Tuple, NoReturn, Union
+from contextlib import contextmanager
+import time
+
+from dpr_encoder import DPREncoder
+
+@contextmanager
+def timer(name):
+    t0 = time.time()
+    yield
+    print(f"[{name}] done in {time.time() - t0:.3f} s")
 
 class DenseRetrieval:
 
@@ -21,6 +31,7 @@ class DenseRetrieval:
         self.args = args
         self.dataset = dataset
         self.num_neg = num_neg
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self.data_path = "../data"
 
@@ -54,7 +65,6 @@ class DenseRetrieval:
         else:
             print("Build passage embedding")
             self.train()
-            print(self.p_encoder.shape)
             with open(q_emd_path, "wb") as file:
                 pickle.dump(self.p_encoder, file)
             with open(p_emd_path, "wb") as file:
@@ -162,9 +172,6 @@ class DenseRetrieval:
                     p_outputs = self.p_encoder(**p_inputs)  # (batch_size*(num_neg+1), emb_dim)
                     q_outputs = self.q_encoder(**q_inputs)  # (batch_size*, emb_dim)
 
-                    p_outputs = p_outputs[1]
-                    q_outputs = q_outputs[1]
-
                     # Calculate similarity score & loss
                     p_outputs = p_outputs.view(batch_size, self.num_neg + 1, -1)
                     q_outputs = q_outputs.view(batch_size, 1, -1)
@@ -189,40 +196,76 @@ class DenseRetrieval:
 
                     del p_inputs, q_inputs
 
+    def retrieve(
+        self, dataset: Union[str, Dataset], topk: Optional[int] = 1
+    ) -> Union[Tuple[List, List], pd.DataFrame]:
+        
+        assert self.p_encoder is not None and self.q_encoder is not None, "get_dense_embedding() 메소드를 먼저 수행해줘야합니다."
 
-    def get_relevant_doc(self, query, k=1):
+        # Retrieve한 Passage를 pd.DataFrame으로 반환합니다.
+        total = []
+        doc_scores, doc_indices = self.get_relevant_doc_bulk(
+            dataset["question"], k=topk
+        )
+        for idx, example in enumerate(
+            tqdm(dataset, desc="Dense retrieval: ")
+        ):
+            tmp = {
+                # Query와 해당 id를 반환합니다.
+                "question": example["question"],
+                "id": example["id"],
+                # Retrieve한 Passage의 id, context를 반환합니다.
+                "context": " ".join(
+                    [self.dataset[i]["context"] for i in doc_indices[idx]]
+                ),
+            }
+            if "context" in example.keys() and "answers" in example.keys():
+                # validation 데이터를 사용하면 ground_truth context와 answer도 반환합니다.
+                tmp["original_context"] = example["context"]
+                tmp["answers"] = example["answers"]
+            total.append(tmp)
 
-        args = self.args
-
-        p_encoder = self.p_encoder
-        q_encoder = self.q_encoder
-
+        cqas = pd.DataFrame(total)
+        return cqas
+    
+    def get_p_embedding(self, p_encoder):
         with torch.no_grad():
             p_encoder.eval()
-            q_encoder.eval()
-
-            q_seqs_val = self.tokenizer([query], padding="max_length", truncation=True, return_tensors='pt').to(args.device)
-            q_emb = q_encoder(**q_seqs_val).to('cpu')  # (num_query=1, emb_dim)
 
             p_embs = []
-            for batch in self.passage_dataloader:
-
-                batch = tuple(t.to(args.device) for t in batch)
+            for batch in tqdm(self.passage_dataloader):
                 p_inputs = {
-                    'input_ids': batch[0],
-                    'attention_mask': batch[1],
-                    'token_type_ids': batch[2]
+                    'input_ids': batch[0].to(self.device),
+                    'attention_mask': batch[1].to(self.device),
+                    'token_type_ids': batch[2].to(self.device)
                 }
                 p_emb = p_encoder(**p_inputs).to('cpu')
                 p_embs.append(p_emb)
-
-        p_embs = torch.stack(p_embs, dim=0).view(len(self.passage_dataloader.dataset), -1)  # (num_passage, emb_dim)
-
-        dot_prod_scores = torch.matmul(q_emb, torch.transpose(p_embs, 0, 1))
-        rank = torch.argsort(dot_prod_scores, dim=1, descending=True).squeeze()
-        return rank[:k]
+        p_embs = torch.cat(p_embs, dim=0)
+        return p_embs
     
-    # 참고용 코드입니다 (삭제 예정)
+    def get_q_embedding(self, q_encoder, queries):
+        q_seqs = self.tokenizer(queries, padding="max_length", truncation=True, return_tensors='pt').to(self.device)
+        q_dataset = TensorDataset(
+            q_seqs['input_ids'], q_seqs['attention_mask'], q_seqs['token_type_ids']
+        )
+        q_dataloader = DataLoader(q_dataset, batch_size=self.args.per_device_train_batch_size)
+        with torch.no_grad():
+            q_encoder.eval()
+            
+            q_embs = []
+            for batch in tqdm(q_dataloader):
+                q_inputs = {
+                    'input_ids': batch[0].to(self.device),
+                    'attention_mask': batch[1].to(self.device),
+                    'token_type_ids': batch[2].to(self.device)
+                }
+                q_emb = q_encoder(**q_inputs).to('cpu')
+                q_embs.append(q_emb)
+
+        q_embs = torch.cat(q_embs, dim=0)
+        return q_embs
+    
     def get_relevant_doc_bulk(
         self, queries: List, k: Optional[int] = 1
     ) -> Tuple[List, List]:
@@ -236,19 +279,19 @@ class DenseRetrieval:
         Note:
             vocab 에 없는 이상한 단어로 query 하는 경우 assertion 발생 (예) 뙣뙇?
         """
+        print("q_embedding start")
+        q_embs = self.get_q_embedding(self.q_encoder, queries)
+        print("p_embedding start")
+        p_embs = self.get_p_embedding(self.p_encoder)
 
-        query_vec = self.q_encoder.transform(queries)
-        assert (
-            np.sum(query_vec) != 0
-        ), "오류가 발생했습니다. 이 오류는 보통 query에 vectorizer의 vocab에 없는 단어만 존재하는 경우 발생합니다."
+        print("embedding done")
 
-        result = query_vec * self.p_encoder.T
-        if not isinstance(result, np.ndarray):
-            result = result.toarray()
+        result = torch.matmul(q_embs, torch.transpose(p_embs, 0, 1))
+
         doc_scores = []
         doc_indices = []
         for i in range(result.shape[0]):
-            sorted_result = np.argsort(result[i, :])[::-1]
+            sorted_result = torch.argsort(result[i, :], dim=-1, descending=True).squeeze()
             doc_scores.append(result[i, :][sorted_result].tolist()[:k])
             doc_indices.append(sorted_result.tolist()[:k])
         return doc_scores, doc_indices
@@ -268,9 +311,9 @@ if __name__ == "__main__":
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    tokenizer = AutoTokenizer.from_pretrained("klue/roberta-large")
-    p_encoder = AutoModel.from_pretrained("klue/roberta-large").to(device)
-    q_encoder = AutoModel.from_pretrained("klue/roberta-large").to(device)
+    tokenizer = AutoTokenizer.from_pretrained("klue/bert-base")
+    p_encoder = DPREncoder.from_pretrained("klue/bert-base").to(device)
+    q_encoder = DPREncoder.from_pretrained("klue/bert-base").to(device)
 
     org_dataset = load_from_disk("../data/train_dataset")
     dataset = concatenate_datasets(
@@ -284,3 +327,7 @@ if __name__ == "__main__":
 
     retriever = DenseRetrieval(args, dataset, num_neg=2, tokenizer=tokenizer, p_encoder=p_encoder, q_encoder=q_encoder)
     retriever.get_dense_embedding()
+
+    # result = retriever.retrieve(dataset, topk=3)
+    # result.to_csv("./outputs/result.csv", index=False)
+
