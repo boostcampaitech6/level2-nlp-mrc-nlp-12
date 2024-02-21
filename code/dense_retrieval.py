@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from typing import List, Optional, Tuple, NoReturn, Union
 from contextlib import contextmanager
 import time
+import json
 
 from dpr_encoder import DPREncoder
 
@@ -38,6 +39,9 @@ class DenseRetrieval:
         self.tokenizer = tokenizer
         self.p_encoder = p_encoder
         self.q_encoder = q_encoder
+
+        # wiki로 사용할 데이터셋 경로 추가
+        self.wiki_path = os.path.join(self.data_path, "wikipedia_documents.json")
 
         self.prepare_in_batch_negative(num_neg=num_neg)
 
@@ -216,7 +220,8 @@ class DenseRetrieval:
                 "id": example["id"],
                 # Retrieve한 Passage의 id, context를 반환합니다.
                 "context": " ".join(
-                    [self.dataset[i]["context"] for i in doc_indices[idx]]
+                    [self.contexts[i] for i in doc_indices[idx]]
+                    # [self.dataset[i]["context"] for i in doc_indices[idx]]
                 ),
             }
             if "context" in example.keys() and "answers" in example.keys():
@@ -228,12 +233,29 @@ class DenseRetrieval:
         cqas = pd.DataFrame(total)
         return cqas
     
+    def get_wiki_dataloader(self, wiki_path):
+        with open(wiki_path, "r", encoding="utf-8") as f:
+            wiki = json.load(f)
+
+        self.contexts = list(
+            dict.fromkeys([v["text"] for v in wiki.values()])
+        )
+
+        wiki_seqs = self.tokenizer(self.contexts, padding="max_length", truncation=True, return_tensors='pt')
+        wiki_dataset = TensorDataset(
+            wiki_seqs['input_ids'], wiki_seqs['attention_mask'], wiki_seqs['token_type_ids']
+        )
+        wiki_dataloader = DataLoader(wiki_dataset, batch_size=self.args.per_device_train_batch_size)
+        return wiki_dataloader
+    
     def get_p_embedding(self, p_encoder):
+        p_dataloader = self.get_wiki_dataloader(self.wiki_path)
+        # p_dataloader = self.passage_dataloader
         with torch.no_grad():
             p_encoder.eval()
 
             p_embs = []
-            for batch in tqdm(self.passage_dataloader):
+            for batch in tqdm(p_dataloader):
                 p_inputs = {
                     'input_ids': batch[0].to(self.device),
                     'attention_mask': batch[1].to(self.device),
@@ -328,6 +350,6 @@ if __name__ == "__main__":
     retriever = DenseRetrieval(args, dataset, num_neg=2, tokenizer=tokenizer, p_encoder=p_encoder, q_encoder=q_encoder)
     retriever.get_dense_embedding()
 
-    # result = retriever.retrieve(dataset, topk=3)
-    # result.to_csv("./outputs/result.csv", index=False)
+    result = retriever.retrieve(dataset, topk=1)
+    result.to_csv("./outputs/result.csv", index=False)
 
