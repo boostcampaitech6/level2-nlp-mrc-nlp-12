@@ -220,8 +220,8 @@ class DenseRetrieval:
                 "id": example["id"],
                 # Retrieve한 Passage의 id, context를 반환합니다.
                 "context": " ".join(
-                    [self.contexts[i] for i in doc_indices[idx]]
-                    # [self.dataset[i]["context"] for i in doc_indices[idx]]
+                    # [self.contexts[i] for i in doc_indices[idx]]
+                    [self.dataset[i]["context"] for i in doc_indices[idx]]
                 ),
             }
             if "context" in example.keys() and "answers" in example.keys():
@@ -249,8 +249,8 @@ class DenseRetrieval:
         return wiki_dataloader
     
     def get_p_embedding(self, p_encoder):
-        p_dataloader = self.get_wiki_dataloader(self.wiki_path)
-        # p_dataloader = self.passage_dataloader
+        # p_dataloader = self.get_wiki_dataloader(self.wiki_path)
+        p_dataloader = self.passage_dataloader
         with torch.no_grad():
             p_encoder.eval()
 
@@ -337,6 +337,7 @@ if __name__ == "__main__":
     p_encoder = DPREncoder.from_pretrained("klue/bert-base").to(device)
     q_encoder = DPREncoder.from_pretrained("klue/bert-base").to(device)
 
+    # data_path 입력
     org_dataset = load_from_disk("../data/train_dataset")
     dataset = concatenate_datasets(
         [
@@ -350,6 +351,6 @@ if __name__ == "__main__":
     retriever = DenseRetrieval(args, dataset, num_neg=2, tokenizer=tokenizer, p_encoder=p_encoder, q_encoder=q_encoder)
     retriever.get_dense_embedding()
 
-    result = retriever.retrieve(dataset, topk=1)
-    result.to_csv("./outputs/result.csv", index=False)
+    # result = retriever.retrieve(dataset, topk=1)
+    # result.to_csv("./outputs/result.csv", index=False)
 
