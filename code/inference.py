@@ -21,6 +21,7 @@ from datasets import (
     load_metric,
 )
 from retrieval import SparseRetrieval
+from retrieval_BM25 import BM25SparseRetrieval
 from trainer_qa import QuestionAnsweringTrainer
 from transformers import (
     AutoConfig,
@@ -35,7 +36,6 @@ from transformers import (
 from utils_qa import check_no_error, postprocess_qa_predictions
 
 logger = logging.getLogger(__name__)
-
 
 def main():
     # 가능한 arguments 들은 ./arguments.py 나 transformer package 안의 src/transformers/training_args.py 에서 확인 가능합니다.
@@ -107,16 +107,14 @@ def run_sparse_retrieval(
 ) -> DatasetDict:
 
     # Query에 맞는 Passage들을 Retrieval 합니다.
-    retriever = SparseRetrieval(
-        tokenize_fn=tokenize_fn, data_path=data_path, context_path=context_path
-    )
+
+    # retriever = SparseRetrieval(tokenize_fn=tokenize_fn, data_path=data_path, context_path=context_path)
+    retriever = BM25SparseRetrieval(tokenize_fn=tokenize_fn, data_path=data_path, context_path=context_path)
     retriever.get_sparse_embedding()
 
     if data_args.use_faiss:
         retriever.build_faiss(num_clusters=data_args.num_clusters)
-        df = retriever.retrieve_faiss(
-            datasets["validation"], topk=data_args.top_k_retrieval
-        )
+        df = retriever.retrieve_faiss(datasets["validation"], topk=data_args.top_k_retrieval)
     else:
         df = retriever.retrieve(datasets["validation"], topk=data_args.top_k_retrieval)
 
