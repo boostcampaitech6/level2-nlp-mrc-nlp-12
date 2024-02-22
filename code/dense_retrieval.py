@@ -12,6 +12,7 @@ from typing import List, Optional, Tuple, NoReturn, Union
 from contextlib import contextmanager
 import time
 import json
+import argparse
 
 from dpr_encoder import DPREncoder
 
@@ -321,24 +322,39 @@ class DenseRetrieval:
 
 if __name__ == "__main__":
 
-    args = TrainingArguments(
-        output_dir="dense_retireval",
-        evaluation_strategy="epoch",
-        learning_rate=3e-4,
-        per_device_train_batch_size=2,
-        per_device_eval_batch_size=2,
-        num_train_epochs=2,
-        weight_decay=0.01
+    parser = argparse.ArgumentParser(description='Argparse')
+
+    parser.add_argument('--output_dir', type=str, default="dense_retireval")
+    parser.add_argument('--evaluation_strategy', type=str, default="epoch")
+    parser.add_argument('--learning_rate', type=float, default=3e-4)
+    parser.add_argument('--per_device_train_batch_size', type=int, default=2)
+    parser.add_argument('--per_device_eval_batch_size', type=int, default=2)
+    parser.add_argument('--num_train_epochs', type=int, default=2)
+    parser.add_argument('--weight_decay', type=float, default=0.01)
+    parser.add_argument('--model_name', type=str, default="klue/bert-base")
+    parser.add_argument('--num_neg', type=int, default=2)
+    parser.add_argument('--data_path', type=str, default="../data/train_dataset")
+
+    args = parser.parse_args()
+
+    train_args = TrainingArguments(
+        output_dir=args.output_dir,
+        evaluation_strategy=args.evaluation_strategy,
+        learning_rate=args.learning_rate,
+        per_device_train_batch_size=args.per_device_train_batch_size,
+        per_device_eval_batch_size=args.per_device_eval_batch_size,
+        num_train_epochs=args.num_train_epochs,
+        weight_decay=args.weight_decay,
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    tokenizer = AutoTokenizer.from_pretrained("klue/bert-base")
-    p_encoder = DPREncoder.from_pretrained("klue/bert-base").to(device)
-    q_encoder = DPREncoder.from_pretrained("klue/bert-base").to(device)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    p_encoder = DPREncoder.from_pretrained(args.model_name).to(device)
+    q_encoder = DPREncoder.from_pretrained(args.model_name).to(device)
 
     # data_path 입력
-    org_dataset = load_from_disk("../data/train_dataset")
+    org_dataset = load_from_disk(args.data_path)
     dataset = concatenate_datasets(
         [
             org_dataset["train"].flatten_indices(),
@@ -348,7 +364,7 @@ if __name__ == "__main__":
     print("*" * 40, "query dataset", "*" * 40)
     print(dataset)
 
-    retriever = DenseRetrieval(args, dataset, num_neg=2, tokenizer=tokenizer, p_encoder=p_encoder, q_encoder=q_encoder)
+    retriever = DenseRetrieval(train_args, dataset, args.num_neg, tokenizer=tokenizer, p_encoder=p_encoder, q_encoder=q_encoder)
     retriever.get_dense_embedding()
 
     # result = retriever.retrieve(dataset, topk=1)
