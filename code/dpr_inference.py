@@ -19,9 +19,8 @@ from datasets import (
     Value,
     load_from_disk,
     load_metric,
+    concatenate_datasets,
 )
-from retrieval import SparseRetrieval
-from retrieval_BM25 import BM25SparseRetrieval
 from trainer_qa import QuestionAnsweringTrainer
 from transformers import (
     AutoConfig,
@@ -35,7 +34,12 @@ from transformers import (
 )
 from utils_qa import check_no_error, postprocess_qa_predictions
 
+from dense_retrieval import DenseRetrieval
+from dpr_encoder import DPREncoder
+import torch
+
 logger = logging.getLogger(__name__)
+
 
 def main():
     # 가능한 arguments 들은 ./arguments.py 나 transformer package 안의 src/transformers/training_args.py 에서 확인 가능합니다.
@@ -88,39 +92,53 @@ def main():
 
     # True일 경우 : run passage retrieval
     if data_args.eval_retrieval:
-        datasets = run_sparse_retrieval(
-            tokenizer.tokenize, datasets, training_args, data_args,
+        datasets = run_dense_retrieval(
+            datasets, data_args
         )
 
     # eval or predict mrc model
-    if training_args.do_eval or training_args.do_predict:
-        run_mrc(data_args, training_args, model_args, datasets, tokenizer, model)
+    run_mrc(data_args, training_args, model_args, datasets, tokenizer, model)
 
 
-def run_sparse_retrieval(
-    tokenize_fn: Callable[[str], List[str]],
+def run_dense_retrieval(
     datasets: DatasetDict,
-    training_args: TrainingArguments,
     data_args: DataTrainingArguments,
-    data_path: str = "../data",
+    data_path: str = "../data/train_dataset",
     context_path: str = "wikipedia_documents.json",
+    model_name_or_path: str = "klue/bert-base"
 ) -> DatasetDict:
+    
+    args = TrainingArguments(
+        output_dir="dense_retireval",
+        evaluation_strategy="epoch",
+        learning_rate=3e-4,
+        per_device_train_batch_size=2,
+        per_device_eval_batch_size=2,
+        num_train_epochs=2,
+        weight_decay=0.01
+    )
 
-    # Query에 맞는 Passage들을 Retrieval 합니다.
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # retriever = SparseRetrieval(tokenize_fn=tokenize_fn, data_path=data_path, context_path=context_path)
-    retriever = BM25SparseRetrieval(tokenize_fn=tokenize_fn, data_path=data_path, context_path=context_path)
-    retriever.get_sparse_embedding()
+    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+    p_encoder = DPREncoder.from_pretrained(model_name_or_path).to(device)
+    q_encoder = DPREncoder.from_pretrained(model_name_or_path).to(device)
 
-    if data_args.use_faiss:
-        retriever.build_faiss(num_clusters=data_args.num_clusters)
-        df = retriever.retrieve_faiss(datasets["validation"], topk=data_args.top_k_retrieval)
-    else:
-        df = retriever.retrieve(datasets["validation"], topk=data_args.top_k_retrieval)
+    org_dataset = load_from_disk(data_path)
+    dataset = concatenate_datasets(
+        [
+            org_dataset["train"].flatten_indices(),
+            org_dataset["validation"].flatten_indices(),
+        ]
+    )  # train dev 를 합친 4192 개 질문에 대해 모두 테스트
+    print("*" * 40, "query dataset", "*" * 40)
+    print(dataset)
 
-    # test data 에 대해선 정답이 없으므로 id question context 로만 데이터셋이 구성됩니다.
-    if training_args.do_predict:
-        f = Features(
+    retriever = DenseRetrieval(args, dataset, num_neg=2, tokenizer=tokenizer, p_encoder=p_encoder, q_encoder=q_encoder)
+    retriever.get_dense_embedding()
+
+    df = retriever.retrieve(datasets["validation"], topk=data_args.top_k_retrieval)
+    f = Features(
             {
                 "context": Value(dtype="string", id=None),
                 "id": Value(dtype="string", id=None),
@@ -128,23 +146,6 @@ def run_sparse_retrieval(
             }
         )
 
-    # train data 에 대해선 정답이 존재하므로 id question context answer 로 데이터셋이 구성됩니다.
-    elif training_args.do_eval:
-        f = Features(
-            {
-                "answers": Sequence(
-                    feature={
-                        "text": Value(dtype="string", id=None),
-                        "answer_start": Value(dtype="int32", id=None),
-                    },
-                    length=-1,
-                    id=None,
-                ),
-                "context": Value(dtype="string", id=None),
-                "id": Value(dtype="string", id=None),
-                "question": Value(dtype="string", id=None),
-            }
-        )
     datasets = DatasetDict({"validation": Dataset.from_pandas(df, features=f)})
     return datasets
 
@@ -285,22 +286,21 @@ def run_mrc(
     logger.info("*** Evaluate ***")
 
     #### eval dataset & eval example - predictions.json 생성됨
-    if training_args.do_predict:
-        predictions = trainer.predict(
-            test_dataset=eval_dataset, test_examples=datasets["validation"]
-        )
+    predictions = trainer.predict(
+        test_dataset=eval_dataset, test_examples=datasets["validation"]
+    )
 
-        # predictions.json 은 postprocess_qa_predictions() 호출시 이미 저장됩니다.
-        print(
-            "No metric can be presented because there is no correct answer given. Job done!"
-        )
+    # predictions.json 은 postprocess_qa_predictions() 호출시 이미 저장됩니다.
+    print(
+        "No metric can be presented because there is no correct answer given. Job done!"
+    )
 
-    if training_args.do_eval:
-        metrics = trainer.evaluate()
-        metrics["eval_samples"] = len(eval_dataset)
+    # if training_args.do_eval:
+    #     metrics = trainer.evaluate()
+    #     metrics["eval_samples"] = len(eval_dataset)
 
-        trainer.log_metrics("test", metrics)
-        trainer.save_metrics("test", metrics)
+    #     trainer.log_metrics("test", metrics)
+    #     trainer.save_metrics("test", metrics)
 
 
 if __name__ == "__main__":
